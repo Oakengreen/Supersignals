@@ -4,12 +4,6 @@ import asyncio
 
 logger = logging.getLogger("Channel2")
 
-def ensure_mt5_initialized(mt5_path):
-    """Initialisera MetaTrader 5."""
-    if not mt5.initialize(mt5_path):
-        logger.error("Failed to initialize MT5.")
-        raise Exception("MT5 initialization failed.")
-
 def calculate_lot_size(risk_percent, balance, sl_price, entry_price, total_orders):
     """Calculate lot size based on risk percentage, SL distance, and total allowed orders."""
     total_risk_amount = balance * (risk_percent / 100)
