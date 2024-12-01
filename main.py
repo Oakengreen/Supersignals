@@ -43,8 +43,9 @@ async def handle_channel_3(event):
 # Hantera signaler från Kanal 4
 @client.on(events.NewMessage(chats=GROUP_ID4))
 async def handle_channel_4(event):
+    logger.info("------------------------------------------------------------------")
     logger.info("[Channel 4] New message received.")
-    await process_channel_4_signal(event.raw_text, MT5_PATH_ALT)  # Skicka till alternativ MT5-path
+    await process_channel_4_signal(event.raw_text, MT5_PATH)  # Skicka till alternativ MT5-path
 
 # Main-funktion
 async def main():
