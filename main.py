@@ -6,6 +6,7 @@ from channel_1 import process_scalping_signal
 from channel_2 import process_channel_2_signal
 from channel_3 import process_channel_3_signal
 from channel_4 import process_channel_4_signal
+#from channel_5 import process_channel_5_signal
 import MetaTrader5 as mt5  # Importera MT5-modulen
 
 # Logger setup
@@ -46,6 +47,12 @@ async def handle_channel_4(event):
     logger.info("------------------------------------------------------------------")
     logger.info("[Channel 4] New message received.")
     await process_channel_4_signal(event.raw_text, MT5_PATH)  # Skicka till alternativ MT5-path
+
+#@client.on(events.NewMessage(chats=GROUP_ID5))  # Lägg till GROUP_ID5 i settings
+#async def handle_channel_5(event):
+#    logger.info("------------------------------------------------------------------")
+#    logger.info("[Channel 5] New message received.")
+#    await process_channel_5_signal(event.raw_text, MT5_PATH_ALT)
 
 # Main-funktion
 async def main():

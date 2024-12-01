@@ -8,7 +8,7 @@ SYMBOL_MAP = {
     "US30": "DJ30",  # Mappa US30 till DJ30
 }
 
-last_trend = {}
+#last_order = {}
 
 
 def calculate_atr(symbol, period=14):
@@ -28,7 +28,6 @@ def calculate_atr(symbol, period=14):
     atr = sum(tr_values) / period
     return atr
 
-
 def calculate_pip_value(symbol_info):
     """Beräkna pipvärdet per kontrakt baserat på symbolinfo."""
     if symbol_info.trade_tick_size > 0:
@@ -38,11 +37,9 @@ def calculate_pip_value(symbol_info):
     else:
         raise ValueError(f"Invalid tick size for {symbol_info.name}. Cannot calculate pip value.")
 
-
 def map_symbol(symbol):
     """Mappa symbol till broker-specifik symbol om det behövs."""
     return SYMBOL_MAP.get(symbol, symbol)
-
 
 def position_size(balance, symbol, sl_distance_usd):
     """Beräkna en fast lotstorlek för att säkerställa korrekt riskhantering."""
@@ -72,12 +69,14 @@ async def process_channel_4_signal(message, mt5_path):
         logger.info(f"Processed lines: {lines}")
 
         action_line = lines[0].strip().upper()
+
         if "BUY" in action_line:
             action = mt5.ORDER_TYPE_BUY
         elif "SELL" in action_line:
             action = mt5.ORDER_TYPE_SELL
         else:
             raise ValueError("Invalid action in message. Expected 'BUY' or 'SELL'.")
+
         logger.info(f"Action parsed: {'BUY' if action == mt5.ORDER_TYPE_BUY else 'SELL'}")
 
         symbol = map_symbol(action_line.split()[1].upper().rstrip(":"))
@@ -87,6 +86,34 @@ async def process_channel_4_signal(message, mt5_path):
             raise ValueError(f"Symbol {symbol} is not available or not visible in MetaTrader 5.")
         logger.info(f"Symbol info: {symbol_info}")
 
+        # Kontrollera om det redan finns en öppen position
+        open_positions = mt5.positions_get(symbol=symbol)
+        if open_positions:
+            current_position = open_positions[0]
+            logger.info(f"Existing position detected: {current_position}")
+
+            # Om signalen motsvarar motsatt ordertyp, stäng befintlig order
+            if (current_position.type == mt5.ORDER_TYPE_BUY and action == mt5.ORDER_TYPE_SELL) or \
+               (current_position.type == mt5.ORDER_TYPE_SELL and action == mt5.ORDER_TYPE_BUY):
+                logger.info(f"Closing existing position: {current_position}")
+                close_action = mt5.ORDER_TYPE_SELL if current_position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                close_request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": current_position.volume,
+                    "type": close_action,
+                    "price": mt5.symbol_info_tick(symbol).bid if close_action == mt5.ORDER_TYPE_SELL else mt5.symbol_info_tick(symbol).ask,
+                    "deviation": 500,
+                    "magic": 0,
+                    "comment": "Channel4_CloseOpposite",
+                    "type_filling": mt5.ORDER_FILLING_FOK,
+                }
+                close_result = mt5.order_send(close_request)
+                if close_result.retcode != mt5.TRADE_RETCODE_DONE:
+                    raise ValueError(f"Failed to close existing position: {close_result.comment}")
+                logger.info(f"Position closed successfully: {close_result}")
+
+        # Fortsätt med att lägga den nya ordern
         logger.info("Fetching account balance...")
         balance = mt5.account_info().balance
         risk_amount = round(balance * 0.01, 4)  # 1% av balans
@@ -97,40 +124,48 @@ async def process_channel_4_signal(message, mt5_path):
         sl_distance = round(atr * 2, 4)  # ATR x 2
         logger.info(f"ATR: {atr}, SL Distance (ATR x 2): {sl_distance}")
 
+        # Pipvärde och kontraktsstorlek
         pip_value = calculate_pip_value(symbol_info)
         sl_distance_usd = round(sl_distance * pip_value, 4)
         logger.info(f"SL Distance USD: {sl_distance_usd}")
 
-        # Simulera med 1 lot
-        simulated_fixed_lot_size = 1.0
-        simulated_risk = round(simulated_fixed_lot_size * sl_distance_usd, 4)
-        logger.info(f"Simulated Fixed Lot Size: {simulated_fixed_lot_size}, Simulated Risk: {simulated_risk}, Expected Risk: {risk_amount}")
+        # Spread-hantering
+        spread = symbol_info.spread * symbol_info.point
+        logger.info(f"Spread (in price units): {spread}")
 
-        # Dynamisk lotstorlek baserat på risk
-        calculated_lot_size = round(risk_amount / sl_distance_usd, 2)
-        logger.info(f"Dynamically Calculated Lot Size: {calculated_lot_size}")
+        # Dynamiskt beräknad lotstorlek baserat på risk
+        lot_size = round(risk_amount / sl_distance_usd, 2)
+        logger.info(f"Dynamically Calculated Lot Size: {lot_size}")
 
-        # Kontrollera marginal och justera lotstorlek
-        adjusted_lot_size = calculated_lot_size
-        while adjusted_lot_size >= 0.01:  # Minsta lotstorlek
-            required_margin = mt5.order_calc_margin(action, symbol, adjusted_lot_size, mt5.symbol_info_tick(symbol).ask)
-            free_margin = mt5.account_info().margin_free
-            if required_margin is not None and free_margin >= required_margin:
-                break  # Om marginalen räcker, använd denna storlek
-            adjusted_lot_size = round(adjusted_lot_size - 0.01, 2)  # Minska lotstorleken
-        if adjusted_lot_size < 0.01:
-            raise ValueError(f"Insufficient margin for any lot size. Free={free_margin}, Required={required_margin}")
-        logger.info(f"Adjusted Lot Size: {adjusted_lot_size}")
-
-        logger.info("Preparing order...")
+        # Kontroll och justering för marginal
         current_price = mt5.symbol_info_tick(symbol).ask if action == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(
             symbol).bid
-        sl = current_price - sl_distance if action == mt5.ORDER_TYPE_BUY else current_price + sl_distance
-        tp = current_price + sl_distance * 1.5 if action == mt5.ORDER_TYPE_BUY else current_price - sl_distance * 1.5
+        while lot_size >= symbol_info.volume_min:
+            required_margin = mt5.order_calc_margin(action, symbol, lot_size, current_price)
+            free_margin = mt5.account_info().margin_free
+            if required_margin is None:
+                raise ValueError(f"Failed to calculate margin: {mt5.last_error()}")
+            if free_margin >= required_margin:
+                break  # Tillräcklig marginal hittades
+            #logger.warning(f"Margin issue: Required={required_margin}, Free={free_margin}. Reducing lot size.")
+            lot_size = round(lot_size - symbol_info.volume_step, 2)
+
+        if lot_size < symbol_info.volume_min:
+            raise ValueError(f"Insufficient margin for minimum lot size {symbol_info.volume_min}. Free={free_margin}")
+
+        logger.info(f"Adjusted Lot Size: {lot_size}")
+
+        logger.info("Preparing order...")
+        if action == mt5.ORDER_TYPE_BUY:
+            sl = current_price - sl_distance - spread  # Spread subtraheras vid BUY
+            tp = current_price + sl_distance * 1.5
+        else:
+            sl = current_price + sl_distance + spread  # Spread adderas vid SELL
+            tp = current_price - sl_distance * 1.5
         order = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": adjusted_lot_size,
+            "volume": lot_size,
             "type": action,
             "price": current_price,
             "sl": round(sl, 4),
@@ -152,6 +187,7 @@ async def process_channel_4_signal(message, mt5_path):
 
     except Exception as e:
         logger.error(f"Error processing signal from Channel 4: {e}")
+
 
 
 
