@@ -1,6 +1,6 @@
 import logging
 import MetaTrader5 as mt5
-import math
+from chart_visualization import plot_candlestick_chart
 
 logger = logging.getLogger("Channel4")
 
@@ -10,6 +10,8 @@ SYMBOL_MAP = {
 
 #last_order = {}
 
+# Global ordbok för att lagra trender per symbol
+current_trends = {}
 
 def calculate_atr(symbol, period=14):
     """Beräkna ATR (Average True Range) för en given symbol."""
@@ -54,8 +56,49 @@ def position_size(balance, symbol, sl_distance_usd):
     lot_size = max(min(round(lot_size, 2), max_lot), min_lot)
 
     logger.info(f"Lot Size calculated: {lot_size}")
+
     return lot_size
 
+def update_trend(message):
+    """Uppdaterar trenden baserat på inkommande meddelande."""
+    global current_trends
+
+    # Dela upp meddelandet i rader och rensa tomma rader
+    lines = [line.strip() for line in message.strip().split("\n") if line.strip()]
+
+    # Initialisera variabler för trend och symbol
+    trend = None
+    symbol = None
+
+    # Extrahera trenden och symbolen från respektive rader
+    for line in lines:
+        if line.startswith("TREND:"):
+            trend = line.split("TREND:")[1].strip().upper()
+            logger.info(f"Extracted trend: {trend}")
+        elif line.startswith("SYMBOL:"):
+            raw_symbol = line.split("SYMBOL:")[1].strip().upper()
+            symbol = map_symbol(raw_symbol)  # Mappa symbolen här
+            logger.info(f"Extracted and mapped symbol: {symbol}")
+
+    # Kontrollera att både trend och symbol är tillgängliga
+    if trend and symbol:
+        if trend in ["UP", "DN", "DOWN"]:  # Hantera DN som DOWN
+            current_trends[symbol] = "UP" if trend == "UP" else "DOWN"
+            logger.info(f"Trend updated: {symbol} is now in {current_trends[symbol]} trend.")
+        else:
+            logger.warning(f"Unrecognized trend direction: {trend}")
+    else:
+        logger.warning(f"Invalid trend or symbol format: {message}")
+
+    # Logga aktuella trender
+    logger.info(f"Current Trends: {current_trends}")
+
+def get_trend(symbol):
+    """Hämtar aktuell trend för en symbol."""
+    mapped_symbol = map_symbol(symbol)  # Mappa symbolen
+    trend = current_trends.get(mapped_symbol, "UNKNOWN")
+    logger.info(f"Current trend for {mapped_symbol}: {trend}")
+    return trend
 
 async def process_channel_4_signal(message, mt5_path):
     """Processa inkommande signaler från Kanal 4."""
@@ -68,16 +111,14 @@ async def process_channel_4_signal(message, mt5_path):
         lines = [line.strip() for line in message.strip().split("\n") if line.strip()]
         logger.info(f"Processed lines: {lines}")
 
+        # Kontrollera om meddelandet innehåller en trenduppdatering
+        if any(line.startswith("TREND:") for line in lines):
+            logger.info("Detected trend update message. Triggering update_trend().")
+            update_trend(message)
+            return  # Avsluta processen här eftersom det är en trenduppdatering
+
         action_line = lines[0].strip().upper()
-
-        if "BUY" in action_line:
-            action = mt5.ORDER_TYPE_BUY
-        elif "SELL" in action_line:
-            action = mt5.ORDER_TYPE_SELL
-        else:
-            raise ValueError("Invalid action in message. Expected 'BUY' or 'SELL'.")
-
-        logger.info(f"Action parsed: {'BUY' if action == mt5.ORDER_TYPE_BUY else 'SELL'}")
+        action = mt5.ORDER_TYPE_BUY if "BUY" in action_line else mt5.ORDER_TYPE_SELL
 
         symbol = map_symbol(action_line.split()[1].upper().rstrip(":"))
         logger.info(f"Symbol parsed: {symbol}")
@@ -86,109 +127,160 @@ async def process_channel_4_signal(message, mt5_path):
             raise ValueError(f"Symbol {symbol} is not available or not visible in MetaTrader 5.")
         logger.info(f"Symbol info: {symbol_info}")
 
-        # Kontrollera om det redan finns en öppen position
-        open_positions = mt5.positions_get(symbol=symbol)
-        if open_positions:
-            current_position = open_positions[0]
-            logger.info(f"Existing position detected: {current_position}")
+        # Kontrollera trenden innan vi fortsätter
+        trend = get_trend(symbol)
+        if action == mt5.ORDER_TYPE_BUY and trend != "UP":
+            logger.error(f"Cannot place BUY order for {symbol} as trend is {trend}.")
+            return
+        elif action == mt5.ORDER_TYPE_SELL and trend != "DOWN":
+            logger.error(f"Cannot place SELL order for {symbol} as trend is {trend}.")
+            return
 
-            # Om signalen motsvarar motsatt ordertyp, stäng befintlig order
-            if (current_position.type == mt5.ORDER_TYPE_BUY and action == mt5.ORDER_TYPE_SELL) or \
-               (current_position.type == mt5.ORDER_TYPE_SELL and action == mt5.ORDER_TYPE_BUY):
-                logger.info(f"Closing existing position: {current_position}")
-                close_action = mt5.ORDER_TYPE_SELL if current_position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                close_request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": current_position.volume,
-                    "type": close_action,
-                    "price": mt5.symbol_info_tick(symbol).bid if close_action == mt5.ORDER_TYPE_SELL else mt5.symbol_info_tick(symbol).ask,
-                    "deviation": 500,
-                    "magic": 0,
-                    "comment": "Channel4_CloseOpposite",
-                    "type_filling": mt5.ORDER_FILLING_FOK,
-                }
-                close_result = mt5.order_send(close_request)
-                if close_result.retcode != mt5.TRADE_RETCODE_DONE:
-                    raise ValueError(f"Failed to close existing position: {close_result.comment}")
-                logger.info(f"Position closed successfully: {close_result}")
+        # Hämta aktuellt pris, spread och andra symbolparametrar
+        tick = mt5.symbol_info_tick(symbol)
+        current_price = tick.ask if action == mt5.ORDER_TYPE_BUY else tick.bid
+        spread = abs(tick.ask - tick.bid)
+        min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
+        one_pip = symbol_info.point
 
-        # Fortsätt med att lägga den nya ordern
-        logger.info("Fetching account balance...")
+        logger.info(f"Current Price: {current_price}")
+        logger.info(f"Spread: {spread}")
+        logger.info(f"Minimum Stop Distance: {min_stop_distance}")
+        logger.info(f"One Pip Value: {one_pip}")
+
+        if min_stop_distance <= 0 or one_pip <= 0:
+            raise ValueError(f"Invalid stop level or pip value for {symbol}. Check broker configuration.")
+
+        # Hämta de senaste två candlarna
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 5)
+        if rates is None or len(rates) < 5:
+            raise ValueError(f"Not enough data to calculate SL for {symbol}.")
+
+        # Extract OHLC data för de senaste candlarna
+        previous_high = rates[3][2]  # High för föregående candle (rates[3])
+        previous_low = rates[3][3]  # Low för föregående candle (rates[3])
+
+        logger.info(f"Previous Candle OHLC: High={previous_high}, Low={previous_low}")
+
+        # Beräkna SL och TP baserat på föregående candle
+        if action == mt5.ORDER_TYPE_SELL:
+            # För en säljorder: Stop Loss ska vara föregående högsta pris + spread
+            sl = previous_high + spread
+            tp = sl - (sl - previous_high) * 1.3  # TP som är 1.3 gånger SL-avståndet
+        else:
+            # För en köporder: Stop Loss ska vara föregående lägsta pris - spread
+            sl = previous_low - spread
+            tp = sl + (previous_low - sl) * 1.3  # TP som är 1.3 gånger SL-avståndet
+
+        logger.info(f"Calculated SL: {sl}, Calculated TP: {tp}")
+
+        # Förbered de slutliga värdena som ska skickas till grafen
+        final_values = {
+            "sl": round(sl, 4),
+            "tp": round(tp, 4),
+            "current_price": current_price,
+            "spread": spread,
+            "symbol": symbol,
+            "action": action
+        }
+
+        # Skicka dessa värden till grafen
+        try:
+            # Skapa graf för visualisering
+            logger.info(f"Creating chart for visualization...")
+            try:
+                chart_path = plot_candlestick_chart(final_values)
+                logger.info(f"Chart saved at: {chart_path}")
+            except Exception as e:
+                logger.error(f"Failed to create chart: {e}")
+
+        except Exception as e:
+            logger.error(f"Error processing signal from Channel 4: {e}")
+
+        # Beräkna lotstorlek och kontrollera margin
         balance = mt5.account_info().balance
         risk_amount = round(balance * 0.01, 4)  # 1% av balans
         logger.info(f"Account Balance: {balance}, Risk Amount (1%): {risk_amount}")
 
-        logger.info("Calculating ATR...")
-        atr = calculate_atr(symbol)
-        sl_distance = round(atr * 2, 4)  # ATR x 2
-        logger.info(f"ATR: {atr}, SL Distance (ATR x 2): {sl_distance}")
-
-        # Pipvärde och kontraktsstorlek
         pip_value = calculate_pip_value(symbol_info)
-        sl_distance_usd = round(sl_distance * pip_value, 4)
-        logger.info(f"SL Distance USD: {sl_distance_usd}")
-
-        # Spread-hantering
-        spread = symbol_info.spread * symbol_info.point
-        logger.info(f"Spread (in price units): {spread}")
-
-        # Dynamiskt beräknad lotstorlek baserat på risk
+        sl_distance_usd = abs(sl - current_price) * pip_value
         lot_size = round(risk_amount / sl_distance_usd, 2)
-        logger.info(f"Dynamically Calculated Lot Size: {lot_size}")
 
-        # Kontroll och justering för marginal
-        current_price = mt5.symbol_info_tick(symbol).ask if action == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(
-            symbol).bid
         while lot_size >= symbol_info.volume_min:
             required_margin = mt5.order_calc_margin(action, symbol, lot_size, current_price)
             free_margin = mt5.account_info().margin_free
-            if required_margin is None:
-                raise ValueError(f"Failed to calculate margin: {mt5.last_error()}")
             if free_margin >= required_margin:
-                break  # Tillräcklig marginal hittades
-            #logger.warning(f"Margin issue: Required={required_margin}, Free={free_margin}. Reducing lot size.")
+                break
             lot_size = round(lot_size - symbol_info.volume_step, 2)
 
         if lot_size < symbol_info.volume_min:
             raise ValueError(f"Insufficient margin for minimum lot size {symbol_info.volume_min}. Free={free_margin}")
 
-        logger.info(f"Adjusted Lot Size: {lot_size}")
+        logger.info(f"Final Lot Size: {lot_size}")
 
-        logger.info("Preparing order...")
-        if action == mt5.ORDER_TYPE_BUY:
-            sl = current_price - sl_distance - spread  # Spread subtraheras vid BUY
-            tp = current_price + sl_distance * 1.5
-        else:
-            sl = current_price + sl_distance + spread  # Spread adderas vid SELL
-            tp = current_price - sl_distance * 1.5
-        order = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot_size,
-            "type": action,
-            "price": current_price,
-            "sl": round(sl, 4),
-            "tp": round(tp, 4),
-            "deviation": 500,
-            "magic": 0,
-            "comment": "Channel4_Signal",
-            "type_filling": mt5.ORDER_FILLING_FOK,
-        }
-        logger.info(f"Order prepared: {order}")
+        # Förbered och skicka order
+        try:
+            # Förbered och skicka order med beräknade SL och TP
+            order = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": lot_size,  # Använd beräknad lotstorlek
+                "type": action,
+                "price": current_price,
+                "sl": round(sl, 4),
+                "tp": round(tp, 4),
+                "deviation": 500,
+                "magic": 0,
+                "comment": "Channel4_Signal",
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            logger.info(f"Order prepared: {order}")
 
-        logger.info("Sending order...")
-        result = mt5.order_send(order)
-        logger.info(f"Order result: {result}")
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Order placed successfully for {symbol}: {result}")
-        else:
-            raise ValueError(f"Order failed: Retcode={result.retcode}, Description={mt5.last_error()}")
+            # Skicka ordern till MT5
+            result = mt5.order_send(order)
+            logger.info(f"Order result: {result}")
+
+            # Hantera resultatet
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                # Hantera Invalid Stops-fel
+                if result.comment == "Invalid stops":
+                    logger.warning("Invalid stops detected. Retrying with fixed SL and TP distances.")
+
+                    # Fasta SL och TP avstånd
+                    fixed_sl_distance = 100 * symbol_info.point
+                    fixed_tp_distance = 130 * symbol_info.point
+
+                    # Uppdatera SL och TP baserat på action
+                    sl = current_price + fixed_sl_distance if action == mt5.ORDER_TYPE_SELL else current_price - fixed_sl_distance
+                    tp = current_price - fixed_tp_distance if action == mt5.ORDER_TYPE_SELL else current_price + fixed_tp_distance
+
+                    logger.info(f"Retrying order with Fixed SL={sl}, Fixed TP={tp}")
+
+                    # Skapa graf med de fasta värdena
+                    logger.info(f"Creating chart for visualization...FIXED")
+                    try:
+                        chart_path = plot_candlestick_chart(final_values)
+                        logger.info(f"Chart saved at: {chart_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to create chart: {e}")
+
+                    # Uppdatera ordern och skicka om
+                    order["sl"] = round(sl, 4)
+                    order["tp"] = round(tp, 4)
+                    retry_result = mt5.order_send(order)
+
+                    if retry_result.retcode != mt5.TRADE_RETCODE_DONE:
+                        logger.error(f"Retry failed. Error: {retry_result}")
+                        raise ValueError(f"Retry failed: {retry_result}")
+                    else:
+                        logger.info(f"Retry successful: {retry_result}")
+                else:
+                    raise ValueError(f"Order failed: {result}")
+            else:
+                logger.info(f"Order placed successfully for {symbol}: {result}")
+
+        except Exception as e:
+            logger.error(f"Error processing signal from Channel 4: {e}")
 
     except Exception as e:
         logger.error(f"Error processing signal from Channel 4: {e}")
-
-
-
-
-
