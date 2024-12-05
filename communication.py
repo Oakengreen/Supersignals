@@ -1,9 +1,9 @@
 # communication.py
-import queue
+import asyncio
 from collections import defaultdict
 
-# Skapa en global kö för trådkommunikation
-update_queue = queue.Queue()
+# Skapa en global kö för asynkron kommunikation
+update_queue = asyncio.Queue()
 
 # Skapa en global dictionary för hedged positions
 # Struktur: { original_ticket: hedge_ticket }

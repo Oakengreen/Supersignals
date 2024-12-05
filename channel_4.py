@@ -175,7 +175,16 @@ async def process_channel_4_signal(message, mt5_path):
 
     except Exception as e:
         logger.error(f"Error processing channel 4 signal: {e}")
-        update_queue.put({'type': 'label', 'text': f"Error processing signal: {e}"})
+
+async def supervise_monitor_equity():
+    """Supervisorn som säkerställer att monitor_equity alltid körs."""
+    while True:
+        try:
+            await monitor_equity()
+        except Exception as e:
+            logger.error(f"monitor_equity crashed: {e}. Restarting in 5 seconds.")
+            await asyncio.sleep(5)  # Vänta innan du startar om
+            continue
 
 def close_position(position):
     """Stänger en specifik position."""
@@ -298,6 +307,17 @@ def close_all_orders():
                 original_orders_per_symbol[symbol] -= 1
                 logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
 
+def initialize_order_tracking():
+    """Initialisera orderspårning baserat på befintliga öppna positioner."""
+    open_positions = mt5.positions_get()
+    if open_positions:
+        for position in open_positions:
+            symbol = position.symbol
+            # Antag att varje befintlig position är en originalorder
+            original_orders_per_symbol[symbol] += 1
+            logger.info(f"Tracking existing position {position.ticket} for symbol {symbol}.")
+            logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
+
 async def monitor_equity():
     """Övervaka total equity och profit för alla positioner, och hantera hedge-logik."""
     global monitoring_equity
@@ -312,7 +332,7 @@ async def monitor_equity():
             # Hämta öppna positioner
             open_positions = mt5.positions_get()
             if not open_positions or len(open_positions) == 0:
-                update_queue.put({'type': 'label', 'text': "No open positions."})  # Uppdatera GUI via kön
+                await update_queue.put({'type': 'label', 'text': "No open positions."})  # Uppdatera GUI via kön
                 logger.info("No open positions. Monitoring paused.")
                 monitoring_equity = False  # Reset flaggan
                 await asyncio.sleep(10)  # Vänta innan du kontrollerar igen
@@ -391,99 +411,16 @@ async def monitor_equity():
                             last_logged = hedge_warning_logged.get(symbol, 0)
                             if current_time - last_logged > cooldown_period:
                                 logger.warning(f"Cannot place hedge for {symbol}. Max hedge orders reached ({current_hedges}/{max_allowed_hedges}).")
+                                await update_queue.put({'type': 'label', 'text': f"Cannot place hedge for {symbol}. Max hedge orders reached."})
                                 hedge_warning_logged[symbol] = current_time
                     else:
                         logger.debug(f"No original orders for {symbol}. Skipping hedge placement.")
 
                 # Uppdatera GUI med ny position och hedgestatus via kön
-                update_queue.put({'type': 'position_status', 'position': position})
+                await update_queue.put({'type': 'position_status', 'position': position})
 
         except Exception as e:
-            update_queue.put({'type': 'label', 'text': f"Error in equity monitoring: {e}"})  # Uppdatera GUI via kön
+            await update_queue.put({'type': 'label', 'text': f"Error in equity monitoring: {e}"})  # Uppdatera GUI via kön
             logger.error(f"Error in equity monitoring: {e}")
 
         await asyncio.sleep(10)  # Vänta 10 sekunder innan nästa kontroll
-
-async def supervise_monitor_equity():
-    """Supervisorn som säkerställer att monitor_equity alltid körs."""
-    while True:
-        try:
-            await monitor_equity()
-        except Exception as e:
-            logger.error(f"monitor_equity crashed: {e}. Restarting in 5 seconds.")
-            await asyncio.sleep(5)  # Vänta innan du startar om
-            continue
-
-def open_hedge_order(lot_size, position):
-    """Lägger en hedge-order för en given position."""
-    symbol = position.symbol
-
-    # Kontrollera symbol och tick-data
-    symbol_info = mt5.symbol_info(symbol)
-    tick = mt5.symbol_info_tick(symbol)
-    if symbol_info is None or tick is None:
-        logger.error(f"Failed to retrieve symbol info or tick data for {symbol}.")
-        return
-
-    # Bestäm hedge-typ (motsatt riktning av ursprungliga positionen)
-    hedge_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    hedge_price = tick.ask if hedge_type == mt5.ORDER_TYPE_BUY else tick.bid
-
-    # Kontrollera margin
-    required_margin = mt5.order_calc_margin(hedge_type, symbol, lot_size, hedge_price)
-    account_info = mt5.account_info()
-    if account_info is None:
-        logger.error("Failed to fetch account info.")
-        return
-    free_margin = account_info.margin_free
-    logger.debug(f"Required Margin: {required_margin}, Free Margin: {free_margin}")
-    if required_margin > free_margin:
-        logger.error("Insufficient margin to place hedge order.")
-        return
-
-    # Kontrollera om vi redan har en hedge för denna position
-    if position.ticket in hedged_positions:
-        logger.info(f"Position {position.ticket} is already hedged.")
-        return
-
-    # Kontrollera om vi kan lägga till ytterligare en hedge för symbolen
-    max_allowed_hedges = original_orders_per_symbol[symbol]
-    current_hedges = hedge_orders_per_symbol[symbol]
-
-    if current_hedges >= max_allowed_hedges:
-        current_time = time.time()
-        cooldown_period = 60  # 60 sekunder
-        last_logged = hedge_warning_logged.get(symbol, 0)
-        if current_time - last_logged > cooldown_period:
-            logger.warning(f"Cannot place hedge for {symbol}. Max hedge orders reached ({current_hedges}/{max_allowed_hedges}).")
-            hedge_warning_logged[symbol] = current_time
-        return
-
-    # Skicka hedge-ordern
-    hedge_order = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": lot_size,
-        "type": hedge_type,
-        "price": hedge_price,
-        "deviation": 20,  # Minska deviation
-        "magic": 0,
-        "comment": "Hedge_Order",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    # Logga hedge_order innan skickning
-    logger.debug(f"Placing hedge order: {hedge_order}")
-
-    result = mt5.order_send(hedge_order)
-
-    # Logga hela resultatet för detaljerad felsökning
-    logger.debug(f"OrderSendResult: retcode={result.retcode}, deal={result.deal}, order={result.order}, volume={result.volume}, price={result.price}, comment='{result.comment}'")
-
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.error(f"Failed to place hedge order for {symbol}. Retcode: {result.retcode}, Comment: {result.comment}")
-    else:
-        logger.info(f"Successfully placed hedge order for {symbol}. Hedge Ticket: {result.order}")
-        hedged_positions[position.ticket] = result.order  # Lägg till mapping mellan original och hedge
-        hedge_orders_per_symbol[symbol] += 1  # Öka antalet hedge-order för symbolen
-        logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")

@@ -1,14 +1,25 @@
-# main.py (uppdatera main-funktionen)
-
+# main.py
+import asyncio
+import logging
 from channel_4 import (
-    process_channel_4_signal,
     supervise_monitor_equity,
-    monitor_equity,
-    close_position,
-    close_all_orders,
-    open_hedge_order,
     initialize_order_tracking
 )
+from communication import update_queue
+
+# Importera andra nödvändiga moduler och funktioner
+
+# Konfigurera loggning om det inte redan är gjort
+logging.basicConfig(
+    level=logging.INFO,  # Justera nivå som behövs
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler("supersignals.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger("Main")
 
 
 async def main():
@@ -29,14 +40,24 @@ async def main():
     while True:
         try:
             # Hantera uppdateringar från update_queue
-            update = update_queue.get()
+            update = await update_queue.get()
             if update:
                 if update['type'] == 'label':
                     # Uppdatera GUI etikett
-                    pass  # Implementera GUI-uppdatering
+                    logger.info(f"Label Update: {update['text']}")
+                    # Implementera GUI-uppdatering här
                 elif update['type'] == 'position_status':
                     # Uppdatera GUI med positionstatus
-                    pass  # Implementera GUI-uppdatering
+                    position = update['position']
+                    logger.info(f"Position Status Update: {position}")
+                    # Implementera GUI-uppdatering här
             await asyncio.sleep(1)  # Justera efter behov
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Program terminated by user.")
