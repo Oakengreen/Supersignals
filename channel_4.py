@@ -1,97 +1,34 @@
+# channel_4.py
 import logging
 import MetaTrader5 as mt5
-from chart_visualization import plot_candlestick_chart
+import asyncio
+import time  # För tidskontroll i throttling
+from settings import EMA_PERIOD
+from communication import (
+    update_queue,
+    hedged_positions,
+    original_orders_per_symbol,
+    hedge_orders_per_symbol
+)
 
 logger = logging.getLogger("Channel4")
+logger.setLevel(logging.INFO)  # Justera loggnivå enligt behov
 
 SYMBOL_MAP = {
     "US30": "DJ30",  # Mappa US30 till DJ30
 }
 
-#last_order = {}
-
 # Global ordbok för att lagra trender per symbol
 current_trends = {}
+# Variabel för att hålla koll på om monitor_equity är igång
+monitoring_equity = False
 
-def calculate_atr(symbol, period=14):
-    """Beräkna ATR (Average True Range) för en given symbol."""
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, period + 1)
-    if rates is None or len(rates) < period + 1:
-        raise ValueError(f"Not enough data to calculate ATR for {symbol}.")
-
-    tr_values = []
-    for i in range(1, len(rates)):
-        high = rates[i][2]  # Justera index för 'high'
-        low = rates[i][3]  # Justera index för 'low'
-        prev_close = rates[i - 1][4]  # Justera index för 'close'
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        tr_values.append(tr)
-
-    atr = sum(tr_values) / period
-    return atr
-
-def calculate_pip_value(symbol_info):
-    """Beräkna pipvärdet per kontrakt baserat på symbolinfo."""
-    if symbol_info.trade_tick_size > 0:
-        pip_value = symbol_info.trade_tick_value / symbol_info.trade_tick_size
-        logger.info(f"Pip Value calculated: {pip_value}")
-        return pip_value
-    else:
-        raise ValueError(f"Invalid tick size for {symbol_info.name}. Cannot calculate pip value.")
+# Global dictionary för att logga senaste varningstid per symbol
+hedge_warning_logged = {}
 
 def map_symbol(symbol):
     """Mappa symbol till broker-specifik symbol om det behövs."""
     return SYMBOL_MAP.get(symbol, symbol)
-
-def position_size(balance, symbol, sl_distance_usd):
-    """Beräkna en fast lotstorlek för att säkerställa korrekt riskhantering."""
-    leverage = mt5.account_info().leverage
-    price = (mt5.symbol_info(symbol).ask + mt5.symbol_info(symbol).bid) / 2
-    trade_size = mt5.symbol_info(symbol).trade_contract_size
-    lot_size = (balance * leverage) / (sl_distance_usd * price * trade_size)
-
-    # Anpassa till symbolens gränser
-    min_lot = mt5.symbol_info(symbol).volume_min
-    max_lot = mt5.symbol_info(symbol).volume_max
-    lot_size = max(min(round(lot_size, 2), max_lot), min_lot)
-
-    logger.info(f"Lot Size calculated: {lot_size}")
-
-    return lot_size
-
-def update_trend(message):
-    """Uppdaterar trenden baserat på inkommande meddelande."""
-    global current_trends
-
-    # Dela upp meddelandet i rader och rensa tomma rader
-    lines = [line.strip() for line in message.strip().split("\n") if line.strip()]
-
-    # Initialisera variabler för trend och symbol
-    trend = None
-    symbol = None
-
-    # Extrahera trenden och symbolen från respektive rader
-    for line in lines:
-        if line.startswith("TREND:"):
-            trend = line.split("TREND:")[1].strip().upper()
-            logger.info(f"Extracted trend: {trend}")
-        elif line.startswith("SYMBOL:"):
-            raw_symbol = line.split("SYMBOL:")[1].strip().upper()
-            symbol = map_symbol(raw_symbol)  # Mappa symbolen här
-            logger.info(f"Extracted and mapped symbol: {symbol}")
-
-    # Kontrollera att både trend och symbol är tillgängliga
-    if trend and symbol:
-        if trend in ["UP", "DN", "DOWN"]:  # Hantera DN som DOWN
-            current_trends[symbol] = "UP" if trend == "UP" else "DOWN"
-            logger.info(f"Trend updated: {symbol} is now in {current_trends[symbol]} trend.")
-        else:
-            logger.warning(f"Unrecognized trend direction: {trend}")
-    else:
-        logger.warning(f"Invalid trend or symbol format: {message}")
-
-    # Logga aktuella trender
-    logger.info(f"Current Trends: {current_trends}")
 
 def get_trend(symbol):
     """Hämtar aktuell trend för en symbol."""
@@ -100,187 +37,453 @@ def get_trend(symbol):
     logger.info(f"Current trend for {mapped_symbol}: {trend}")
     return trend
 
+def calculate_ema(symbol, period=EMA_PERIOD, timeframe=mt5.TIMEFRAME_M1):
+    """Beräkna EMA för en given symbol och period."""
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 1)
+    if rates is None or len(rates) < period + 1:
+        raise ValueError(f"Not enough data to calculate EMA for {symbol}.")
+
+    close_prices = [rate[4] for rate in rates]  # Hämta stängningspriser
+    multiplier = 2 / (period + 1)
+    ema = close_prices[0]  # Initiera EMA med första stängningspriset
+
+    for price in close_prices[1:]:
+        ema = (price - ema) * multiplier + ema
+
+    return ema
+
+def check_price_vs_ema(symbol, timeframe=mt5.TIMEFRAME_M1):
+    """
+    Kontrollera om aktuellt pris är över eller under EMA och returnera resultatet.
+
+    Returnerar:
+        dict: {'position': 'above' eller 'below', 'ema': <ema-värde>, 'price': <aktuellt pris>}
+    """
+    ema = calculate_ema(symbol, period=EMA_PERIOD, timeframe=timeframe)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise ValueError(f"Failed to retrieve tick data for {symbol}.")
+    current_price = (tick.ask + tick.bid) / 2  # Medelpris
+
+    position = "above" if current_price > ema else "below"
+    logger.info(f"Current Price: {current_price}, EMA({EMA_PERIOD}): {ema}, Position: {position}")
+    return {"position": position, "ema": ema, "price": current_price}
+
 async def process_channel_4_signal(message, mt5_path):
-    """Processa inkommande signaler från Kanal 4."""
+    """Processa inkommande signaler från Kanal 4 med EMA-villkor och equity-övervakning."""
+    global monitoring_equity
+
     try:
         logger.info("Initializing MetaTrader 5...")
         if not mt5.initialize(mt5_path):
             raise RuntimeError(f"Failed to initialize MT5 at path {mt5_path}")
 
         logger.info(f"Processing message: {message}")
-        lines = [line.strip() for line in message.strip().split("\n") if line.strip()]
-        logger.info(f"Processed lines: {lines}")
 
-        # Kontrollera om meddelandet innehåller en trenduppdatering
-        if any(line.startswith("TREND:") for line in lines):
-            logger.info("Detected trend update message. Triggering update_trend().")
-            update_trend(message)
-            return  # Avsluta processen här eftersom det är en trenduppdatering
+        # Extrahera ordertyp och symbol från meddelandet
+        lines = [line.strip() for line in message.strip().split("\n") if line.strip()]
+        if not lines:
+            logger.error("Received empty message.")
+            return
 
         action_line = lines[0].strip().upper()
-        action = mt5.ORDER_TYPE_BUY if "BUY" in action_line else mt5.ORDER_TYPE_SELL
+        if "BUY" in action_line:
+            action = mt5.ORDER_TYPE_BUY
+        elif "SELL" in action_line:
+            action = mt5.ORDER_TYPE_SELL
+        else:
+            logger.error(f"Unknown action in message: {action_line}")
+            return
 
-        symbol = map_symbol(action_line.split()[1].upper().rstrip(":"))
-        logger.info(f"Symbol parsed: {symbol}")
+        # Hämta symbol från meddelandet
+        try:
+            symbol = map_symbol(action_line.split()[1].upper().rstrip(":"))
+        except IndexError:
+            logger.error(f"Failed to parse symbol from message: {action_line}")
+            return
+
+        logger.info(f"Parsed symbol: {symbol}")
+
+        # Kontrollera om symbol är synlig
         symbol_info = mt5.symbol_info(symbol)
         if not symbol_info or not symbol_info.visible:
             raise ValueError(f"Symbol {symbol} is not available or not visible in MetaTrader 5.")
-        logger.info(f"Symbol info: {symbol_info}")
 
-        # Kontrollera trenden innan vi fortsätter
-        trend = get_trend(symbol)
-        if action == mt5.ORDER_TYPE_BUY and trend != "UP":
-            logger.error(f"Cannot place BUY order for {symbol} as trend is {trend}.")
+        # Kontrollera EMA-filter
+        ema_check = check_price_vs_ema(symbol)
+        if action == mt5.ORDER_TYPE_BUY and ema_check["position"] != "below":
+            logger.info(f"BUY signal rejected: Price is above EMA för {symbol}.")
+            return  # Stoppa om BUY inte uppfyller EMA-kravet
+        elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] != "above":
+            logger.info(f"SELL signal rejected: Price is below EMA för {symbol}.")
+            return  # Stoppa om SELL inte uppfyller EMA-kravet
+
+        logger.info(f"Signal passed EMA filter: {action_line}. EMA={ema_check['ema']}, Price={ema_check['price']}")
+
+        # Hämta aktuellt pris
+        current_price = ema_check["price"]
+
+        # Använd fast lotstorlek
+        fixed_lot_size = 0.1  # Ange fast lotstorlek här
+        logger.info(f"Using fixed lot size: {fixed_lot_size}")
+
+        account_info = mt5.account_info()
+        if account_info is None:
+            logger.error("Failed to fetch account info.")
             return
-        elif action == mt5.ORDER_TYPE_SELL and trend != "DOWN":
-            logger.error(f"Cannot place SELL order for {symbol} as trend is {trend}.")
-            return
 
-        # Hämta aktuellt pris, spread och andra symbolparametrar
-        tick = mt5.symbol_info_tick(symbol)
-        current_price = tick.ask if action == mt5.ORDER_TYPE_BUY else tick.bid
-        spread = abs(tick.ask - tick.bid)
-        min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
-        one_pip = symbol_info.point
+        free_margin = account_info.margin_free
 
-        logger.info(f"Current Price: {current_price}")
-        logger.info(f"Spread: {spread}")
-        logger.info(f"Minimum Stop Distance: {min_stop_distance}")
-        logger.info(f"One Pip Value: {one_pip}")
-
-        if min_stop_distance <= 0 or one_pip <= 0:
-            raise ValueError(f"Invalid stop level or pip value for {symbol}. Check broker configuration.")
-
-        # Hämta de senaste två candlarna
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 5)
-        if rates is None or len(rates) < 5:
-            raise ValueError(f"Not enough data to calculate SL for {symbol}.")
-
-        # Extract OHLC data för de senaste candlarna
-        previous_high = rates[3][2]  # High för föregående candle (rates[3])
-        previous_low = rates[3][3]  # Low för föregående candle (rates[3])
-
-        logger.info(f"Previous Candle OHLC: High={previous_high}, Low={previous_low}")
-
-        # Beräkna SL och TP baserat på föregående candle
-        if action == mt5.ORDER_TYPE_SELL:
-            # För en säljorder: Stop Loss ska vara föregående högsta pris + spread
-            sl = previous_high + spread
-            tp = sl - (sl - previous_high) * 1.3  # TP som är 1.3 gånger SL-avståndet
-        else:
-            # För en köporder: Stop Loss ska vara föregående lägsta pris - spread
-            sl = previous_low - spread
-            tp = sl + (previous_low - sl) * 1.3  # TP som är 1.3 gånger SL-avståndet
-
-        logger.info(f"Calculated SL: {sl}, Calculated TP: {tp}")
-
-        # Förbered de slutliga värdena som ska skickas till grafen
-        final_values = {
-            "sl": round(sl, 4),
-            "tp": round(tp, 4),
-            "current_price": current_price,
-            "spread": spread,
-            "symbol": symbol,
-            "action": action
-        }
-
-        # Skicka dessa värden till grafen
-        try:
-            # Skapa graf för visualisering
-            logger.info(f"Creating chart for visualization...")
-            try:
-                chart_path = plot_candlestick_chart(final_values)
-                logger.info(f"Chart saved at: {chart_path}")
-            except Exception as e:
-                logger.error(f"Failed to create chart: {e}")
-
-        except Exception as e:
-            logger.error(f"Error processing signal from Channel 4: {e}")
-
-        # Beräkna lotstorlek och kontrollera margin
-        balance = mt5.account_info().balance
-        risk_amount = round(balance * 0.01, 4)  # 1% av balans
-        logger.info(f"Account Balance: {balance}, Risk Amount (1%): {risk_amount}")
-
-        pip_value = calculate_pip_value(symbol_info)
-        sl_distance_usd = abs(sl - current_price) * pip_value
-        lot_size = round(risk_amount / sl_distance_usd, 2)
-
-        while lot_size >= symbol_info.volume_min:
-            required_margin = mt5.order_calc_margin(action, symbol, lot_size, current_price)
-            free_margin = mt5.account_info().margin_free
+        while fixed_lot_size >= symbol_info.volume_min:
+            required_margin = mt5.order_calc_margin(action, symbol, fixed_lot_size, current_price)
             if free_margin >= required_margin:
                 break
-            lot_size = round(lot_size - symbol_info.volume_step, 2)
+            fixed_lot_size = round(fixed_lot_size - symbol_info.volume_step, 2)
 
-        if lot_size < symbol_info.volume_min:
+        if fixed_lot_size < symbol_info.volume_min:
             raise ValueError(f"Insufficient margin for minimum lot size {symbol_info.volume_min}. Free={free_margin}")
 
-        logger.info(f"Final Lot Size: {lot_size}")
+        logger.info(f"Final Lot Size: {fixed_lot_size}")
 
-        # Förbered och skicka order
-        try:
-            # Förbered och skicka order med beräknade SL och TP
-            order = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": lot_size,  # Använd beräknad lotstorlek
-                "type": action,
-                "price": current_price,
-                "sl": round(sl, 4),
-                "tp": round(tp, 4),
-                "deviation": 500,
-                "magic": 0,
-                "comment": "Channel4_Signal",
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            logger.info(f"Order prepared: {order}")
+        # Lägg ordern (köp/sälj)
+        order = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": fixed_lot_size,
+            "type": action,
+            "price": current_price,
+            "deviation": 20,  # Minska deviation
+            "magic": 0,
+            "comment": "Channel4_Signal",
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
 
-            # Skicka ordern till MT5
-            result = mt5.order_send(order)
-            logger.info(f"Order result: {result}")
+        result = mt5.order_send(order)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Failed to place order for {symbol}. Error: {result.retcode}, Comment: {result.comment}")
+        else:
+            logger.info(f"Successfully placed {'BUY' if action == mt5.ORDER_TYPE_BUY else 'SELL'} order for {symbol}. Ticket: {result.order}")
 
-            # Hantera resultatet
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                # Hantera Invalid Stops-fel
-                if result.comment == "Invalid stops":
-                    logger.warning("Invalid stops detected. Retrying with fixed SL and TP distances.")
+            # Öka antalet originalorder per symbol
+            original_orders_per_symbol[symbol] += 1
+            logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
 
-                    # Fasta SL och TP avstånd
-                    fixed_sl_distance = 100 * symbol_info.point
-                    fixed_tp_distance = 130 * symbol_info.point
-
-                    # Uppdatera SL och TP baserat på action
-                    sl = current_price + fixed_sl_distance if action == mt5.ORDER_TYPE_SELL else current_price - fixed_sl_distance
-                    tp = current_price - fixed_tp_distance if action == mt5.ORDER_TYPE_SELL else current_price + fixed_tp_distance
-
-                    logger.info(f"Retrying order with Fixed SL={sl}, Fixed TP={tp}")
-
-                    # Skapa graf med de fasta värdena
-                    logger.info(f"Creating chart for visualization...FIXED")
-                    try:
-                        chart_path = plot_candlestick_chart(final_values)
-                        logger.info(f"Chart saved at: {chart_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to create chart: {e}")
-
-                    # Uppdatera ordern och skicka om
-                    order["sl"] = round(sl, 4)
-                    order["tp"] = round(tp, 4)
-                    retry_result = mt5.order_send(order)
-
-                    if retry_result.retcode != mt5.TRADE_RETCODE_DONE:
-                        logger.error(f"Retry failed. Error: {retry_result}")
-                        raise ValueError(f"Retry failed: {retry_result}")
-                    else:
-                        logger.info(f"Retry successful: {retry_result}")
-                else:
-                    raise ValueError(f"Order failed: {result}")
-            else:
-                logger.info(f"Order placed successfully for {symbol}: {result}")
-
-        except Exception as e:
-            logger.error(f"Error processing signal from Channel 4: {e}")
+            # Kontrollera om monitor_equity är igång, och starta den om den inte är det
+            if not monitoring_equity:
+                monitoring_equity = True
+                asyncio.create_task(supervise_monitor_equity())
 
     except Exception as e:
-        logger.error(f"Error processing signal from Channel 4: {e}")
+        logger.error(f"Error processing channel 4 signal: {e}")
+        update_queue.put({'type': 'label', 'text': f"Error processing signal: {e}"})
+
+def close_position(position):
+    """Stänger en specifik position."""
+    if not isinstance(position.ticket, int) or position.ticket <= 0:
+        logger.error(f"Invalid ticket number for position: {position}")
+        return
+
+    order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    tick = mt5.symbol_info_tick(position.symbol)
+    if not tick:
+        logger.error(f"Failed to retrieve tick data for symbol {position.symbol}. Cannot close position {position.ticket}.")
+        return
+
+    price = tick.bid if order_type == mt5.ORDER_TYPE_BUY else tick.ask
+
+    if price == 0.0:
+        logger.error(f"Failed to retrieve price for symbol {position.symbol}. Cannot close position {position.ticket}.")
+        return
+
+    close_order = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": position.symbol,
+        "volume": position.volume,
+        "type": order_type,
+        "position": position.ticket,  # Korrekt position ticket
+        "price": price,
+        "deviation": 20,  # Minska deviation
+        "magic": 0,
+        "comment": "Close_Position",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    # Logga close_order innan skickning
+    logger.debug(f"Closing order: {close_order}")
+
+    result = mt5.order_send(close_order)
+
+    # Logga hela resultatet för detaljerad felsökning
+    logger.debug(f"OrderSendResult: retcode={result.retcode}, deal={result.deal}, order={result.order}, volume={result.volume}, price={result.price}, comment='{result.comment}'")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.error(f"Failed to close position {position.ticket}. Error: {result.retcode}, Comment: {result.comment}")
+    else:
+        logger.info(f"Successfully closed position {position.ticket}. Result: {result}")
+
+        # Om det är en originalorder, minska antalet originalorder och hedge-order
+        symbol = position.symbol
+        if position.ticket in hedged_positions:
+            hedge_ticket = hedged_positions.pop(position.ticket)
+            hedge_orders_per_symbol[symbol] -= 1
+            logger.info(f"Removed hedge ticket {hedge_ticket} for original ticket {position.ticket}.")
+            logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")
+        else:
+            original_orders_per_symbol[symbol] -= 1
+            logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
+
+def close_all_orders():
+    """Stänger alla öppna positioner och verifierar att de stängs."""
+    open_positions = mt5.positions_get()
+    if open_positions is None:
+        logger.error("Failed to fetch open positions.")
+        return
+
+    if len(open_positions) == 0:
+        logger.info("No open positions to close.")
+        return
+
+    for position in open_positions:
+        # Verifiera att position.ticket är giltigt
+        if not isinstance(position.ticket, int) or position.ticket <= 0:
+            logger.error(f"Invalid ticket number for position: {position}")
+            continue
+
+        order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        tick = mt5.symbol_info_tick(position.symbol)
+        if not tick:
+            logger.error(f"Failed to retrieve tick data for symbol {position.symbol}. Cannot close position {position.ticket}.")
+            continue
+
+        price = tick.bid if order_type == mt5.ORDER_TYPE_BUY else tick.ask
+
+        if price == 0.0:
+            logger.error(f"Failed to retrieve price for symbol {position.symbol}. Cannot close position {position.ticket}.")
+            continue
+
+        close_order = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": order_type,
+            "position": position.ticket,  # Korrekt position ticket
+            "price": price,
+            "deviation": 20,  # Minska deviation
+            "magic": 0,
+            "comment": "Close_Position",
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        # Logga close_order innan skickning
+        logger.debug(f"Closing order: {close_order}")
+
+        result = mt5.order_send(close_order)
+
+        # Logga hela resultatet för detaljerad felsökning
+        logger.debug(f"OrderSendResult: retcode={result.retcode}, deal={result.deal}, order={result.order}, volume={result.volume}, price={result.price}, comment='{result.comment}'")
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Failed to close position {position.ticket}. Error: {result.retcode}, Comment: {result.comment}")
+        else:
+            logger.info(f"Successfully closed position {position.ticket}. Result: {result}")
+
+            # Om det är en originalorder, minska antalet originalorder och hedge-order
+            symbol = position.symbol
+            if position.ticket in hedged_positions:
+                hedge_ticket = hedged_positions.pop(position.ticket)
+                hedge_orders_per_symbol[symbol] -= 1
+                logger.info(f"Removed hedge ticket {hedge_ticket} for original ticket {position.ticket}.")
+                logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")
+            else:
+                original_orders_per_symbol[symbol] -= 1
+                logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
+
+async def monitor_equity():
+    """Övervaka total equity och profit för alla positioner, och hantera hedge-logik."""
+    global monitoring_equity
+    logger.info("Starting equity monitoring...")
+
+    profit_threshold = 10.0  # $10 profit gräns
+    loss_threshold = -10.0  # $10 förlust gräns
+    lot_size = 0.1  # Lotstorlek för hedge-order
+
+    while True:
+        try:
+            # Hämta öppna positioner
+            open_positions = mt5.positions_get()
+            if not open_positions or len(open_positions) == 0:
+                update_queue.put({'type': 'label', 'text': "No open positions."})  # Uppdatera GUI via kön
+                logger.info("No open positions. Monitoring paused.")
+                monitoring_equity = False  # Reset flaggan
+                await asyncio.sleep(10)  # Vänta innan du kontrollerar igen
+                continue  # Fortsätt loopen
+
+            # Initialisera: Lägg till öppna positioner som inte redan är spårade
+            for position in open_positions:
+                symbol = position.symbol
+                if original_orders_per_symbol[symbol] == 0:
+                    original_orders_per_symbol[symbol] = 1  # Antag att det finns minst en originalorder
+                    logger.info(f"Tracking existing position {position.ticket} for symbol {symbol}.")
+                    logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
+                # Om du har en mekanism för att spåra specifika orders, implementera det här
+
+            # Hämta total equity och profit
+            account_info = mt5.account_info()
+            if account_info is None:
+                logger.error("Failed to fetch account info.")
+                await asyncio.sleep(10)
+                continue
+
+            equity = account_info.equity
+            balance = account_info.balance
+            total_profit = equity - balance  # Totalt P/L
+
+            # Logga total profit för debugging
+            logger.debug(f"Monitoring Total Equity: Balance={balance:.2f}, Equity={equity:.2f}, Total Profit={total_profit:.2f}")
+
+            # Hantera vinstgräns
+            if total_profit >= profit_threshold:
+                logger.info(f"Total profit reached ${total_profit:.2f}. Closing all orders.")
+                close_all_orders()
+
+                # Verifiera att alla order är stängda
+                remaining_positions = mt5.positions_get()
+                if remaining_positions and len(remaining_positions) > 0:
+                    logger.error("Some positions could not be closed. Continuing monitoring.")
+                else:
+                    logger.info("All positions successfully closed. Stopping monitoring.")
+                monitoring_equity = False  # Reset flaggan
+                await asyncio.sleep(10)  # Vänta innan du kontrollerar igen
+                continue  # Fortsätt loopen
+
+            # Iterera över alla öppna positioner och hantera varje symbol
+            for position in open_positions:
+                # Verifiera att position.ticket är ett positivt heltal
+                if not isinstance(position.ticket, int) or position.ticket <= 0:
+                    logger.error(f"Invalid ticket number for position: {position}")
+                    continue
+
+                symbol = position.symbol
+
+                # Kontrollera om positionen är en hedge-order
+                if position.ticket in hedged_positions.values():
+                    logger.info(f"Skipping hedge order {position.ticket} from hedging.")
+                    continue  # Hoppa över hedge-order
+
+                position_info = f"Position {position.ticket} ({symbol}) - Profit: {position.profit:.2f}"
+
+                # Hantera förlustgräns för varje position
+                if position.profit <= loss_threshold:
+                    # Kontrollera om vi har möjlighet att placera en hedge för denna symbol
+                    max_allowed_hedges = original_orders_per_symbol[symbol]
+                    current_hedges = hedge_orders_per_symbol[symbol]
+
+                    if max_allowed_hedges > 0:
+                        if current_hedges < max_allowed_hedges:
+                            if position.ticket not in hedged_positions:
+                                logger.info(f"Loss threshold reached for position {position.ticket}. Placing hedge.")
+                                open_hedge_order(lot_size, position)
+                                hedge_orders_per_symbol[symbol] += 1
+                                logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")
+                        else:
+                            current_time = time.time()
+                            cooldown_period = 60  # 60 sekunder
+                            last_logged = hedge_warning_logged.get(symbol, 0)
+                            if current_time - last_logged > cooldown_period:
+                                logger.warning(f"Cannot place hedge for {symbol}. Max hedge orders reached ({current_hedges}/{max_allowed_hedges}).")
+                                hedge_warning_logged[symbol] = current_time
+                    else:
+                        logger.debug(f"No original orders for {symbol}. Skipping hedge placement.")
+
+                # Uppdatera GUI med ny position och hedgestatus via kön
+                update_queue.put({'type': 'position_status', 'position': position})
+
+        except Exception as e:
+            update_queue.put({'type': 'label', 'text': f"Error in equity monitoring: {e}"})  # Uppdatera GUI via kön
+            logger.error(f"Error in equity monitoring: {e}")
+
+        await asyncio.sleep(10)  # Vänta 10 sekunder innan nästa kontroll
+
+async def supervise_monitor_equity():
+    """Supervisorn som säkerställer att monitor_equity alltid körs."""
+    while True:
+        try:
+            await monitor_equity()
+        except Exception as e:
+            logger.error(f"monitor_equity crashed: {e}. Restarting in 5 seconds.")
+            await asyncio.sleep(5)  # Vänta innan du startar om
+            continue
+
+def open_hedge_order(lot_size, position):
+    """Lägger en hedge-order för en given position."""
+    symbol = position.symbol
+
+    # Kontrollera symbol och tick-data
+    symbol_info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if symbol_info is None or tick is None:
+        logger.error(f"Failed to retrieve symbol info or tick data for {symbol}.")
+        return
+
+    # Bestäm hedge-typ (motsatt riktning av ursprungliga positionen)
+    hedge_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    hedge_price = tick.ask if hedge_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+    # Kontrollera margin
+    required_margin = mt5.order_calc_margin(hedge_type, symbol, lot_size, hedge_price)
+    account_info = mt5.account_info()
+    if account_info is None:
+        logger.error("Failed to fetch account info.")
+        return
+    free_margin = account_info.margin_free
+    logger.debug(f"Required Margin: {required_margin}, Free Margin: {free_margin}")
+    if required_margin > free_margin:
+        logger.error("Insufficient margin to place hedge order.")
+        return
+
+    # Kontrollera om vi redan har en hedge för denna position
+    if position.ticket in hedged_positions:
+        logger.info(f"Position {position.ticket} is already hedged.")
+        return
+
+    # Kontrollera om vi kan lägga till ytterligare en hedge för symbolen
+    max_allowed_hedges = original_orders_per_symbol[symbol]
+    current_hedges = hedge_orders_per_symbol[symbol]
+
+    if current_hedges >= max_allowed_hedges:
+        current_time = time.time()
+        cooldown_period = 60  # 60 sekunder
+        last_logged = hedge_warning_logged.get(symbol, 0)
+        if current_time - last_logged > cooldown_period:
+            logger.warning(f"Cannot place hedge for {symbol}. Max hedge orders reached ({current_hedges}/{max_allowed_hedges}).")
+            hedge_warning_logged[symbol] = current_time
+        return
+
+    # Skicka hedge-ordern
+    hedge_order = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": hedge_type,
+        "price": hedge_price,
+        "deviation": 20,  # Minska deviation
+        "magic": 0,
+        "comment": "Hedge_Order",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    # Logga hedge_order innan skickning
+    logger.debug(f"Placing hedge order: {hedge_order}")
+
+    result = mt5.order_send(hedge_order)
+
+    # Logga hela resultatet för detaljerad felsökning
+    logger.debug(f"OrderSendResult: retcode={result.retcode}, deal={result.deal}, order={result.order}, volume={result.volume}, price={result.price}, comment='{result.comment}'")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.error(f"Failed to place hedge order for {symbol}. Retcode: {result.retcode}, Comment: {result.comment}")
+    else:
+        logger.info(f"Successfully placed hedge order for {symbol}. Hedge Ticket: {result.order}")
+        hedged_positions[position.ticket] = result.order  # Lägg till mapping mellan original och hedge
+        hedge_orders_per_symbol[symbol] += 1  # Öka antalet hedge-order för symbolen
+        logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")

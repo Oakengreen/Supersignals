@@ -27,3 +27,6 @@ MT5_PATH_ALT = r"C:\\Program Files\\MetaTrader 5 IC Markets (SC)_OPTIMIZER\\term
 TELEGRAM_BOT_TOKEN_CHANNEL_6 = "7700223074:AAFCj8guHqin956tr27aIkWH09EyJyABNpY"
 GROUP_ID6 = -1002438023347  # Kanal-ID för att lyssna på
 TARGET_GROUP_ID6 = -1002476037243  # Målkanal-ID för att skicka meddelanden
+
+#Channel_4 settings
+EMA_PERIOD = 55  # Period för EMA som filter
