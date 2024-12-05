@@ -1,5 +1,4 @@
 # channel_4.py
-import logging
 import MetaTrader5 as mt5
 import asyncio
 import time  # För tidskontroll i throttling
@@ -10,9 +9,28 @@ from communication import (
     original_orders_per_symbol,
     hedge_orders_per_symbol
 )
+import logging
+import os  # För att använda miljövariabeln eller en flagga för testläge
 
+# Skapa logger
 logger = logging.getLogger("Channel4")
-logger.setLevel(logging.INFO)  # Justera loggnivå enligt behov
+
+# Standard loggnivå
+log_level = logging.INFO
+
+# Kontrollera om vi är i testläge (kan sättas via en miljövariabel eller en flagga)
+if os.getenv('TEST_MODE', 'False') == 'True':
+    # Om vi är i testläge, logga till en fil
+    handler = logging.FileHandler('test_log.log')  # Loggar till filen test_log.log
+else:
+    # Annars loggas till standard utmatning (som konsolen)
+    handler = logging.StreamHandler()
+
+# Ange loggnivå och formattering
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(log_level)
 
 SYMBOL_MAP = {
     "US30": "DJ30",  # Mappa US30 till DJ30
@@ -22,9 +40,12 @@ SYMBOL_MAP = {
 current_trends = {}
 # Variabel för att hålla koll på om monitor_equity är igång
 monitoring_equity = False
-
 # Global dictionary för att logga senaste varningstid per symbol
 hedge_warning_logged = {}
+# En global lista eller dict för att hålla reda på den senaste orginalordern per symbol
+last_original_order_per_symbol = {}
+# En global dictionary för att koppla hedgeorder till orginalorder
+hedge_orders_per_original = {}
 
 def map_symbol(symbol):
     """Mappa symbol till broker-specifik symbol om det behövs."""
@@ -163,6 +184,10 @@ async def process_channel_4_signal(message, mt5_path):
             logger.error(f"Failed to place order for {symbol}. Error: {result.retcode}, Comment: {result.comment}")
         else:
             logger.info(f"Successfully placed {'BUY' if action == mt5.ORDER_TYPE_BUY else 'SELL'} order for {symbol}. Ticket: {result.order}")
+
+            # Spara den senaste orginalordern i dictionaryn
+            last_original_order_per_symbol[symbol] = result.order
+            logger.debug(f"Last original order for {symbol}: {last_original_order_per_symbol[symbol]}")
 
             # Öka antalet originalorder per symbol
             original_orders_per_symbol[symbol] += 1
@@ -424,3 +449,79 @@ async def monitor_equity():
             logger.error(f"Error in equity monitoring: {e}")
 
         await asyncio.sleep(10)  # Vänta 10 sekunder innan nästa kontroll
+
+def open_hedge_order(lot_size, position):
+    """Lägger en hedge-order för en given position."""
+    symbol = position.symbol
+
+    # Kontrollera symbol och tick-data
+    symbol_info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if symbol_info is None or tick is None:
+        logger.error(f"Failed to retrieve symbol info or tick data for {symbol}.")
+        return
+
+    # Bestäm hedge-typ (motsatt riktning av ursprungliga positionen)
+    hedge_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    hedge_price = tick.ask if hedge_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+    # Kontrollera margin
+    required_margin = mt5.order_calc_margin(hedge_type, symbol, lot_size, hedge_price)
+    account_info = mt5.account_info()
+    if account_info is None:
+        logger.error("Failed to fetch account info.")
+        return
+    free_margin = account_info.margin_free
+    logger.debug(f"Required Margin: {required_margin}, Free Margin: {free_margin}")
+    if required_margin > free_margin:
+        logger.error("Insufficient margin to place hedge order.")
+        return
+
+    # Kontrollera om vi redan har en hedge för denna position
+    if position.ticket in hedged_positions:
+        logger.info(f"Position {position.ticket} is already hedged.")
+        return
+
+    # Kontrollera om vi kan lägga till ytterligare en hedge för symbolen
+    max_allowed_hedges = original_orders_per_symbol[symbol]
+    current_hedges = hedge_orders_per_symbol[symbol]
+
+    if current_hedges >= max_allowed_hedges:
+        current_time = time.time()
+        cooldown_period = 60  # 60 sekunder
+        last_logged = hedge_warning_logged.get(symbol, 0)
+        if current_time - last_logged > cooldown_period:
+            logger.warning(f"Cannot place hedge for {symbol}. Max hedge orders reached ({current_hedges}/{max_allowed_hedges}).")
+            # Eftersom detta är en synkron funktion, använd asyncio.create_task för att köra asynkrona anrop
+            asyncio.create_task(update_queue.put({'type': 'label', 'text': f"Cannot place hedge for {symbol}. Max hedge orders reached."}))
+            hedge_warning_logged[symbol] = current_time
+        return
+
+    # Skicka hedge-ordern
+    hedge_order = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": hedge_type,
+        "price": hedge_price,
+        "deviation": 20,  # Minska deviation
+        "magic": 0,
+        "comment": "Hedge_Order",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    # Logga hedge_order innan skickning
+    logger.debug(f"Placing hedge order: {hedge_order}")
+
+    result = mt5.order_send(hedge_order)
+
+    # Logga hela resultatet för detaljerad felsökning
+    logger.debug(f"OrderSendResult: retcode={result.retcode}, deal={result.deal}, order={result.order}, volume={result.volume}, price={result.price}, comment='{result.comment}'")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.error(f"Failed to place hedge order for {symbol}. Retcode: {result.retcode}, Comment: {result.comment}")
+    else:
+        logger.info(f"Successfully placed hedge order for {symbol}. Hedge Ticket: {result.order}")
+        hedged_positions[position.ticket] = result.order  # Lägg till mapping mellan original och hedge
+        hedge_orders_per_symbol[symbol] += 1  # Öka antalet hedge-order för symbolen
+        logger.debug(f"Hedge orders for {symbol}: {hedge_orders_per_symbol[symbol]}")
