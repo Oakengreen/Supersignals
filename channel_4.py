@@ -2,7 +2,7 @@
 import MetaTrader5 as mt5
 import asyncio
 import time  # För tidskontroll i throttling
-from settings import EMA_PERIOD
+from settings import EMA_PERIOD, Trendorders
 from communication import (
     update_queue,
     hedged_positions,
@@ -116,7 +116,6 @@ async def process_channel_4_signal(message, mt5_path):
             logger.error(f"Unknown action in message: {action_line}")
             return
 
-        # Hämta symbol från meddelandet
         try:
             symbol = map_symbol(action_line.split()[1].upper().rstrip(":"))
         except IndexError:
@@ -132,19 +131,39 @@ async def process_channel_4_signal(message, mt5_path):
 
         # Kontrollera EMA-filter
         ema_check = check_price_vs_ema(symbol)
-        if action == mt5.ORDER_TYPE_BUY and ema_check["position"] != "below":
-            logger.info(f"BUY signal rejected: Price is above EMA för {symbol}.")
-            return  # Stoppa om BUY inte uppfyller EMA-kravet
-        elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] != "above":
-            logger.info(f"SELL signal rejected: Price is below EMA för {symbol}.")
-            return  # Stoppa om SELL inte uppfyller EMA-kravet
 
-        logger.info(f"Signal passed EMA filter: {action_line}. EMA={ema_check['ema']}, Price={ema_check['price']}")
+        # Introducera en variabel för att hålla reda på om det är en trendorder
+        is_trend_order = False
 
-        # Hämta aktuellt pris
+        # Placera trend-orderlogiken före den vanliga EMA-avvisningen
+        if Trendorders and symbol in hedged_positions:
+            # Kolla om ordern är i trend
+            if action == mt5.ORDER_TYPE_BUY and ema_check["position"] == "below":
+                logger.info(f"BUY signal rejected: Not in trend for {symbol} under EMA.")
+                return
+            elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] == "above":
+                logger.info(f"SELL signal rejected: Not in trend for {symbol} over EMA.")
+                return
+            logger.info(f"Trend order allowed for {action_line} on {symbol}.")
+            is_trend_order = True
+        else:
+            # Normal EMA-koll om vi inte är i trend-läget
+            if action == mt5.ORDER_TYPE_BUY and ema_check["position"] != "below":
+                logger.info(f"BUY signal rejected: Price is above EMA för {symbol}.")
+                return
+            elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] != "above":
+                logger.info(f"SELL signal rejected: Price is below EMA för {symbol}.")
+                return
+
+            logger.info(f"Signal passed EMA filter: {action_line}. EMA={ema_check['ema']}, Price={ema_check['price']}")
+
+            # Kontrollera Trendorders-inställning om vi inte redan beslutat i trendsektionen
+            if not Trendorders and symbol in hedged_positions:
+                logger.info(f"Order rejected due to active hedge on {symbol} and Trendorders=False.")
+                return
+
+        # Om vi kommit hit är ordern godkänd antingen som trendorder eller original-order
         current_price = ema_check["price"]
-
-        # Använd fast lotstorlek
         fixed_lot_size = 0.1  # Ange fast lotstorlek här
         logger.info(f"Using fixed lot size: {fixed_lot_size}")
 
@@ -166,7 +185,13 @@ async def process_channel_4_signal(message, mt5_path):
 
         logger.info(f"Final Lot Size: {fixed_lot_size}")
 
-        # Lägg ordern (köp/sälj)
+        # Sätt kommentaren beroende på ordertyp
+        if is_trend_order:
+            order_comment = "Trendorder"
+        else:
+            # Om det inte är en trendorder är det en original-order
+            order_comment = "Original_order"
+
         order = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -175,7 +200,7 @@ async def process_channel_4_signal(message, mt5_path):
             "price": current_price,
             "deviation": 20,  # Minska deviation
             "magic": 0,
-            "comment": "Channel4_Signal",
+            "comment": order_comment,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
@@ -356,6 +381,25 @@ async def monitor_equity():
         try:
             # Hämta öppna positioner
             open_positions = mt5.positions_get()
+
+            # --- Ny kod start ---
+            # Nollställ alla räknare innan vi räknar om från verkliga data
+            for sym in original_orders_per_symbol.keys():
+                original_orders_per_symbol[sym] = 0
+            for sym in hedge_orders_per_symbol.keys():
+                hedge_orders_per_symbol[sym] = 0
+
+            # Räkna om räknarna baserat på aktuella öppna positioner
+            if open_positions:
+                for position in open_positions:
+                    symbol = position.symbol
+                    # Om positionens ticket finns i hedged_positions.values() så är det en hedge-order
+                    if position.ticket in hedged_positions.values():
+                        hedge_orders_per_symbol[symbol] += 1
+                    else:
+                        original_orders_per_symbol[symbol] += 1
+            # --- Ny kod slut ---
+
             if not open_positions or len(open_positions) == 0:
                 await update_queue.put({'type': 'label', 'text': "No open positions."})  # Uppdatera GUI via kön
                 logger.info("No open positions. Monitoring paused.")
@@ -364,13 +408,16 @@ async def monitor_equity():
                 continue  # Fortsätt loopen
 
             # Initialisera: Lägg till öppna positioner som inte redan är spårade
+            # (Denna del är nu mest redundant, då vi redan byggt upp räknarna baserat på öppna positioner
+            #  i koden ovan. Men om du vill behålla logiken för att logga befintliga positioner kan den vara kvar.)
             for position in open_positions:
                 symbol = position.symbol
+                # Om positionen redan räknats som originalorder behöver vi inte sätta om den,
+                # men om du vill behålla denna logg för debugging kan du låta den vara.
                 if original_orders_per_symbol[symbol] == 0:
-                    original_orders_per_symbol[symbol] = 1  # Antag att det finns minst en originalorder
+                    original_orders_per_symbol[symbol] = 1
                     logger.info(f"Tracking existing position {position.ticket} for symbol {symbol}.")
                     logger.debug(f"Original orders for {symbol}: {original_orders_per_symbol[symbol]}")
-                # Om du har en mekanism för att spåra specifika orders, implementera det här
 
             # Hämta total equity och profit
             account_info = mt5.account_info()

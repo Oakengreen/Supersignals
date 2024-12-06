@@ -30,3 +30,5 @@ TARGET_GROUP_ID6 = -1002476037243  # Målkanal-ID för att skicka meddelanden
 
 #Channel_4 settings
 EMA_PERIOD = 55  # Period för EMA som filter
+Trendorders = True
+
