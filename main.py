@@ -2,7 +2,7 @@
 from telethon import TelegramClient, events
 import asyncio
 import logging
-import threading
+#import threading
 from settings import (
     TELEGRAM_API_ID,
     TELEGRAM_API_HASH,
@@ -11,7 +11,7 @@ from settings import (
 )
 from channel_4 import process_channel_4_signal, supervise_monitor_equity
 import MetaTrader5 as mt5
-import gui_visualization  # Se till att den är i samma mapp eller ange rätt sökväg
+#import gui_visualization  # Se till att den är i samma mapp eller ange rätt sökväg
 
 # Konfigurera loggning till konsolen med INFO-nivå
 logging.basicConfig(

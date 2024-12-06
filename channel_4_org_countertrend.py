@@ -137,21 +137,19 @@ async def process_channel_4_signal(message, mt5_path):
         # Introducera en variabel för att avgöra ordertyp i kommentaren
         is_trend_order = False
 
-        # Ändring start:
-        # Om Trendorders = True och symbolen har hedge, skippa vanlig EMA-logik
-        # (Trendorder tillåts oavsett EMA-läge)
+        # Om det är en trendorder-situation, skippa den vanliga EMA-avvisningen
+        # och tillåt ordern utan att kolla position vs EMA.
         if Trendorders and symbol in hedged_positions:
+            # Trendorder tillåten oavsett EMA-läge
             is_trend_order = True
             logger.info(f"Trend order allowed for {action_line} on {symbol}.")
         else:
-            # Ny logik för originalorder:
-            # BUY endast om position == "above"
-            # SELL endast om position == "below"
-            if action == mt5.ORDER_TYPE_BUY and ema_check["position"] != "above":
-                logger.warning(f"BUY signal rejected: Price is not above EMA för {symbol}.")
+            # Kör vanlig EMA-avvisning om det INTE är en trendorder
+            if action == mt5.ORDER_TYPE_BUY and ema_check["position"] != "below":
+                logger.warning(f"BUY signal rejected: Price is above EMA för {symbol}.")
                 return
-            elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] != "below":
-                logger.warning(f"SELL signal rejected: Price is not below EMA för {symbol}.")
+            elif action == mt5.ORDER_TYPE_SELL and ema_check["position"] != "above":
+                logger.warning(f"SELL signal rejected: Price is below EMA för {symbol}.")
                 return
 
             logger.info(f"Signal passed EMA filter: {action_line}. EMA={ema_check['ema']}, Price={current_price}")
@@ -160,7 +158,6 @@ async def process_channel_4_signal(message, mt5_path):
             if not Trendorders and symbol in hedged_positions:
                 logger.info(f"Order rejected due to active hedge on {symbol} and Trendorders=False.")
                 return
-        # Ändring slut
 
         # Nu skall ordern läggas. Bestäm kommentaren beroende på ordertyp
         if is_trend_order:
@@ -170,7 +167,7 @@ async def process_channel_4_signal(message, mt5_path):
             order_comment = "Original_order"
 
         # Använd fast lotstorlek
-        fixed_lot_size = 0.1
+        fixed_lot_size = 1.0
         logger.info(f"Using fixed lot size: {fixed_lot_size}")
 
         account_info = mt5.account_info()
@@ -224,7 +221,6 @@ async def process_channel_4_signal(message, mt5_path):
 
     except Exception as e:
         logger.error(f"Error processing channel 4 signal: {e}")
-
 
 async def supervise_monitor_equity():
     """Supervisorn som säkerställer att monitor_equity alltid körs."""
@@ -373,9 +369,9 @@ async def monitor_equity():
     global monitoring_equity
     logger.info("Starting equity monitoring...")
 
-    profit_threshold = 10.0  # $10 profit gräns
-    loss_threshold = -20.0  # $10 förlust gräns
-    lot_size = 0.1  # Lotstorlek för hedge-order
+    profit_threshold = 100.0  # $10 profit gräns
+    loss_threshold = -80.0  # $10 förlust gräns
+    lot_size = 1.0  # Lotstorlek för hedge-order
 
     while True:
         try:
